@@ -595,6 +595,24 @@ def _parse_env_file_for_key(path: Path, key: str) -> Optional[str]:
     return None
 
 
+def _clean_token(token: Any) -> str:
+    """Normalize token by stripping whitespace, surrounding quotes, and accidental Bearer prefix."""
+    if token is None:
+        return ""
+    t = str(token).strip()
+    while (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1].strip()
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    return t
+
+
+def _mask_secret(val: str) -> str:
+    if len(val) >= 8:
+        return f"{val[:4]}...{val[-4:]} (len={len(val)})"
+    return f"len={len(val)}"
+
+
 def _resolve_platform_var(
     key: str,
     config: Optional[PlatformConfig] = None,
@@ -602,19 +620,24 @@ def _resolve_platform_var(
 ) -> str:
     """Resolve a platform setting or credential with multi-layer fallback:
     1. config direct attributes (e.g. config.token)
-    2. config.extra dictionary (e.g. extra['token'], extra['bot_token'], extra[key.lower()])
+    2. config.extra dictionary (e.g. extra['token'], extra['bot_token'])
     3. Hermes scoped secret manager (agent.secret_scope.get_secret) for MULTIPLEX profiles
-    4. Process environment (os.getenv)
-    5. Profile-local .env files on disk (HERMES_HOME, active profile, profiles/*)
+    4. Profile-local .env files on disk (HERMES_HOME, active profile, profiles/*)
+    5. Process-global environment (os.getenv) — LAST fallback so profile-specific config wins
     """
-    # 1. Check config direct attributes
-    if config is not None:
-        if key == "MAX_BOT_TOKEN":
-            cfg_tok = getattr(config, "token", None) or getattr(config, "api_key", None)
-            if cfg_tok and str(cfg_tok).strip():
-                return str(cfg_tok).strip()
+    is_token = (key == "MAX_BOT_TOKEN")
 
-        # 2. Check config.extra dictionary
+    # 1. Check config direct attributes
+    if config is not None and is_token:
+        cfg_tok = getattr(config, "token", None) or getattr(config, "api_key", None)
+        if cfg_tok and str(cfg_tok).strip():
+            cleaned = _clean_token(cfg_tok)
+            if cleaned:
+                logger.info("Max: %s resolved from config attribute [%s]", key, _mask_secret(cleaned))
+                return cleaned
+
+    # 2. Check config.extra dictionary
+    if config is not None:
         extra = getattr(config, "extra", {}) or {}
         if isinstance(extra, dict):
             short_key = key.lower().removeprefix("max_")
@@ -624,12 +647,16 @@ def _resolve_platform_var(
                 short_key,
                 f"max_{short_key}",
             ]
-            if key == "MAX_BOT_TOKEN":
+            if is_token:
                 candidates.extend(["token", "bot_token", "api_key"])
             for candidate in candidates:
                 val = extra.get(candidate)
                 if val is not None and str(val).strip():
-                    return str(val).strip()
+                    cleaned = _clean_token(val) if is_token else str(val).strip()
+                    if cleaned:
+                        mask_info = _mask_secret(cleaned) if is_token else f"val={cleaned[:30]}"
+                        logger.info("Max: %s resolved from config.extra['%s'] [%s]", key, candidate, mask_info)
+                        return cleaned
 
     # 3. Hermes profile-scoped secret manager (crucial for gateway.multiplex_profiles mode)
     try:
@@ -637,20 +664,18 @@ def _resolve_platform_var(
 
         val = get_secret(key, None)
         if val is not None and str(val).strip():
-            return str(val).strip()
+            cleaned = _clean_token(val) if is_token else str(val).strip()
+            if cleaned:
+                mask_info = _mask_secret(cleaned) if is_token else f"val={cleaned[:30]}"
+                logger.info("Max: %s resolved from agent.secret_scope [%s]", key, mask_info)
+                return cleaned
     except Exception:
         pass
 
-    # 4. Process-global environment
-    val = os.getenv(key)
-    if val is not None and str(val).strip():
-        return str(val).strip()
-
-    # 5. Disk fallback: check .env strictly for the target profile home
+    # 4. Profile-local .env files on disk (checked BEFORE os.getenv so profile overrides global env)
     dirs_to_check: list[Path] = []
     try:
         home = get_hermes_home()
-        dirs_to_check.append(home)
 
         # Check explicit profile hints on config / extra
         target_profile: Optional[str] = None
@@ -672,11 +697,15 @@ def _resolve_platform_var(
                 if act_name:
                     dirs_to_check.insert(0, home / "profiles" / act_name)
 
-        # If home is a root container and exactly one profile exists, safe to check it
-        if not target_profile and (home / "profiles").is_dir():
+        # Profile home directory
+        dirs_to_check.append(home)
+
+        # If home is a root container and profiles exist
+        if (home / "profiles").is_dir():
             sub_profiles = [p for p in (home / "profiles").iterdir() if p.is_dir() and (p / ".env").is_file()]
-            if len(sub_profiles) == 1:
-                dirs_to_check.append(sub_profiles[0])
+            for p in sub_profiles:
+                if p not in dirs_to_check:
+                    dirs_to_check.append(p)
 
         dirs_to_check.append(Path.cwd())
     except Exception:
@@ -686,9 +715,22 @@ def _resolve_platform_var(
         try:
             parsed = _parse_env_file_for_key(candidate_dir / ".env", key)
             if parsed:
-                return parsed
+                cleaned = _clean_token(parsed) if is_token else parsed
+                if cleaned:
+                    mask_info = _mask_secret(cleaned) if is_token else f"val={cleaned[:30]}"
+                    logger.info("Max: %s resolved from %s [%s]", key, candidate_dir / ".env", mask_info)
+                    return cleaned
         except Exception:
             continue
+
+    # 5. Process-global environment (last fallback)
+    val = os.getenv(key)
+    if val is not None and str(val).strip():
+        cleaned = _clean_token(val) if is_token else str(val).strip()
+        if cleaned:
+            mask_info = _mask_secret(cleaned) if is_token else f"val={cleaned[:30]}"
+            logger.info("Max: %s resolved from os.getenv [%s]", key, mask_info)
+            return cleaned
 
     return default
 
@@ -768,13 +810,27 @@ class MaxAdapter(BasePlatformAdapter):
             connector=aiohttp.TCPConnector(ssl=_max_ssl_context()),
         )
 
+        masked_token = _mask_secret(self.token)
+        logger.info("Max: verifying credentials via GET %s/me [token %s]", self._api_base_url, masked_token)
+
         # Verify token without consuming updates. MAX requires Authorization header.
         try:
             async with self._session.get(
                 f"{self._api_base_url}/me", timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status != 200:
-                    logger.error(f"Max: /me returned {resp.status}")
+                    resp_body = ""
+                    try:
+                        resp_body = (await resp.text()).strip()
+                    except Exception:
+                        pass
+                    logger.error(
+                        "Max: /me returned %s: %s [api_url=%s, token %s]",
+                        resp.status,
+                        resp_body or "(empty body)",
+                        self._api_base_url,
+                        masked_token,
+                    )
                     await self._session.close()
                     self._session = None
                     return False
@@ -782,7 +838,7 @@ class MaxAdapter(BasePlatformAdapter):
                 self._bot_user_id = str(data.get("user_id") or "")
                 logger.info("Max: connected OK as %s", data.get("username") or data.get("name") or data.get("user_id") or "?")
         except Exception as e:
-            logger.error(f"Max: token check failed: {e}")
+            logger.error("Max: token check failed: %s [api_url=%s, token %s]", e, self._api_base_url, masked_token)
             await self._session.close()
             self._session = None
             return False
