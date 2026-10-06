@@ -10,6 +10,7 @@ the old host still answers as of this patch but is not guaranteed to stay up)
 """
 
 import asyncio
+from contextvars import ContextVar
 import hashlib
 import hmac
 import json
@@ -48,6 +49,7 @@ _RUSSIAN_CA_BUNDLE_FILES = (
     _PLUGIN_DIR / "ca" / "russian_trusted_root_ca.pem",
 )
 _ssl_context_cache: Optional[ssl.SSLContext] = None
+_force_document_var: ContextVar[bool] = ContextVar("_force_document_var", default=False)
 
 
 def _max_ssl_context() -> ssl.SSLContext:
@@ -1149,6 +1151,8 @@ class MaxAdapter(BasePlatformAdapter):
                 if resp.status == 200:
                     return json.loads(text) if text.strip() else {}
                 logger.warning(f"Max API POST /messages → {resp.status}: {text[:300]}")
+                if "attachment.not.ready" in text or "not.processed" in text:
+                    return {"_error_code": "attachment.not.ready", "_error_text": text}
                 if resp.status not in (400, 422) or body.get("format") != "markdown":
                     return {}
         except Exception as e:
@@ -1564,6 +1568,7 @@ class MaxAdapter(BasePlatformAdapter):
             if upload_type in {"video", "audio"} and upload_init.get("token"):
                 payload = {"token": upload_init["token"]}
                 logger.info("Max: uploaded %s → payload keys=%s", file_path, sorted(payload.keys()))
+                await asyncio.sleep(0.5)
                 return payload
 
             payload = upload_result if isinstance(upload_result, dict) else {}
@@ -1571,6 +1576,7 @@ class MaxAdapter(BasePlatformAdapter):
                 payload["token"] = upload_init["token"]
             if payload:
                 logger.info("Max: uploaded %s → payload keys=%s", file_path, sorted(payload.keys()))
+                await asyncio.sleep(0.5)
                 return payload
             logger.warning("Max upload data returned empty payload for %s", file_path)
         except Exception as e:
@@ -1584,7 +1590,7 @@ class MaxAdapter(BasePlatformAdapter):
         payload: dict,
         caption: Optional[str] = None,
         *,
-        max_attempts: int = 6,
+        max_attempts: int = 10,
     ) -> SendResult:
         caption_chunks = _split_max_text(caption or "")
         first_caption = caption_chunks[0] if caption_chunks else ""
@@ -1598,13 +1604,13 @@ class MaxAdapter(BasePlatformAdapter):
 
         # MAX can accept the upload and still reject immediate /messages with
         # attachment.not.ready while the media backend finishes processing the
-        # returned token. Retry with a small backoff; this matches the public
-        # upload flow where video/audio tokens are sent only after upload
-        # completion, but processing can lag for larger media.
-        delays = (1.0, 2.0, 3.0, 5.0, 8.0)
+        # returned token. Retry with backoff; this matches the official MAX docs
+        # where processing can lag for larger media files.
+        delays = (1.5, 2.5, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0)
+        last_error = "Max attachment message failed"
         for attempt in range(max_attempts):
             result = await self._api_post_message({"chat_id": chat_id}, body)
-            if result:
+            if result and not result.get("_error_code"):
                 message_ids = [str(result.get("message_id", ""))]
                 for index, chunk in enumerate(caption_chunks[1:], start=2):
                     text_result = await self._send_text_message(chat_id, chunk)
@@ -1621,9 +1627,16 @@ class MaxAdapter(BasePlatformAdapter):
                     message_id=message_ids[-1] if message_ids else "",
                     continuation_message_ids=tuple(message_ids[:-1]),
                 )
+            if result and result.get("_error_code") == "attachment.not.ready":
+                last_error = f"Max attachment processing not ready: {result.get('_error_text', '')[:200]}"
+                logger.info(
+                    "Max: attachment not ready yet (attempt %d/%d), waiting...",
+                    attempt + 1,
+                    max_attempts,
+                )
             if attempt < max_attempts - 1:
                 await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
-        return SendResult(success=False, error="Max attachment message failed")
+        return SendResult(success=False, error=last_error)
 
     async def send_image(self, chat_id, image_url, caption=None) -> SendResult:
         return await self._send_media(chat_id, image_url, "image", caption)
@@ -1665,6 +1678,17 @@ class MaxAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Max file upload failed")
         return await self._send_attachment_message(chat_id, "file", payload, caption)
 
+    @classmethod
+    def extract_media(cls, content: str):
+        """Extract media and track if document delivery is explicitly requested."""
+        content_str = content or ""
+        as_doc = any(tag in content_str for tag in ("[[as_document]]", "[[as_file]]", "[[force_document]]"))
+        _force_document_var.set(as_doc)
+        cleaned = content_str
+        for tag in ("[[as_file]]", "[[force_document]]"):
+            cleaned = cleaned.replace(tag, "")
+        return super().extract_media(cleaned)
+
     async def send_voice(
         self,
         chat_id,
@@ -1680,11 +1704,24 @@ class MaxAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="audio_path is required")
 
         meta = metadata or {}
-        if bool(kwargs.get("force_document")) or bool(meta.get("force_document")) or bool(meta.get("as_document")):
+        caption_str = caption or ""
+        force_doc = (
+            _force_document_var.get()
+            or bool(kwargs.get("force_document"))
+            or bool(kwargs.get("as_document"))
+            or bool(meta.get("force_document"))
+            or bool(meta.get("as_document"))
+            or any(tag in caption_str for tag in ("[[as_document]]", "[[as_file]]", "[[force_document]]"))
+        )
+        if force_doc:
+            clean_caption = caption_str
+            for tag in ("[[as_document]]", "[[as_file]]", "[[force_document]]"):
+                clean_caption = clean_caption.replace(tag, "")
+            clean_caption = clean_caption.strip() or None
             return await self.send_document(
                 chat_id=chat_id,
                 file_path=audio_path,
-                caption=caption,
+                caption=clean_caption,
                 reply_to=reply_to,
                 metadata=metadata,
             )
@@ -2147,6 +2184,12 @@ async def _standalone_send(
     try:
         results = []
         caption = message or ""
+        if any(tag in caption for tag in ("[[as_document]]", "[[as_file]]", "[[force_document]]")):
+            force_document = True
+            for tag in ("[[as_document]]", "[[as_file]]", "[[force_document]]"):
+                caption = caption.replace(tag, "")
+            caption = caption.strip()
+
         for entry in media_files or []:
             # send_message_tool's internal helpers pass (path, is_voice)
             # tuples in some call sites and bare path strings in others —
@@ -2204,8 +2247,10 @@ def register(ctx):
             "Поддерживает markdown: **bold**, *italic*, ~~strikethrough~~, `code`, "
             "[links](url), ## headers. Таблиц нет — используй списки. "
             "Можно отправлять изображения, файлы и голосовые/аудиосообщения: чтобы доставить файл пользователю, "
-            "добавь в ответ MEDIA:/absolute/path/to/file. Аудиофайлы и голосовые (.mp3, .wav, .m4a, .ogg) "
-            "отправляются как голосовые/аудиосообщения. "
+            "добавь в ответ MEDIA:/absolute/path/to/file. "
+            "По умолчанию аудиофайлы и голосовые (.mp3, .wav, .m4a, .ogg) отправляются как голосовые/аудиосообщения с аудиоплеером. "
+            "Если нужно отправить аудиофайл именно как обычный файл/документ (без аудиоплеера/голосового), "
+            "добавь в ответ директиву [[as_document]], например: MEDIA:/absolute/path/to/file.mp3 [[as_document]]. "
             "Для inline-кнопок можно добавить в конец ответа скрытый HTML-комментарий "
             "`<!-- max_buttons: [[{\"text\":\"Текст\",\"payload\":\"callback\"}]] -->` "
             "или кнопку-ссылку `<!-- max_buttons: [[{\"text\":\"Открыть\",\"url\":\"https://example.com\"}]] -->`, "

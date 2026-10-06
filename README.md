@@ -145,7 +145,13 @@ MEDIA:/absolute/path/to/file.png
 ```
 
 Audio files such as `.mp3`, `.wav`, `.m4a`, and `.ogg` are delivered as
-native audio/voice attachments by default (or as files/documents when `force_document` is set).
+native audio/voice attachments by default with an audio player.
+To deliver an audio file as a regular downloadable file/document instead of audio/voice,
+include the `[[as_document]]` directive in the response:
+
+```text
+MEDIA:/absolute/path/to/track.mp3 [[as_document]]
+```
 
 ## Inline Keyboards
 
