@@ -1674,19 +1674,13 @@ class MaxAdapter(BasePlatformAdapter):
         metadata=None,
         **kwargs,
     ) -> SendResult:
-        """Send audio from a local path without MAX-side recompression.
-
-        Hermes' generic gateway routes every recognized audio extension through
-        ``send_voice(audio_path=...)``.  MAX may transcode native audio/voice
-        attachments, so preserve the original bytes by delivering audio as a
-        regular document by default.  Direct callers can explicitly opt into a
-        native MAX voice attachment with ``metadata={"max_native_voice": True}``.
-        """
+        """Send audio/voice from a local path as a native MAX audio attachment."""
         audio_path = path or kwargs.get("audio_path") or kwargs.get("voice_path") or kwargs.get("file_path")
         if not audio_path:
             return SendResult(success=False, error="audio_path is required")
 
-        if not bool((metadata or {}).get("max_native_voice")):
+        meta = metadata or {}
+        if bool(kwargs.get("force_document")) or bool(meta.get("force_document")) or bool(meta.get("as_document")):
             return await self.send_document(
                 chat_id=chat_id,
                 file_path=audio_path,
@@ -2118,7 +2112,7 @@ def _env_enablement() -> dict:
 
 
 _STANDALONE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-_STANDALONE_VOICE_EXTS = {".ogg", ".oga", ".opus"}
+_STANDALONE_VOICE_EXTS = {".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".aac", ".flac"}
 _STANDALONE_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 
 
@@ -2209,9 +2203,9 @@ def register(ctx):
             "You are on Max Messenger (max.ru) — российский мессенджер. "
             "Поддерживает markdown: **bold**, *italic*, ~~strikethrough~~, `code`, "
             "[links](url), ## headers. Таблиц нет — используй списки. "
-            "Можно отправлять изображения и файлы: чтобы доставить файл пользователю, "
-            "добавь в ответ MEDIA:/absolute/path/to/file. Аудиофайлы (.mp3, .wav, .m4a, .ogg) "
-            "отправляй именно как файлы/document, а не как voice/audio, чтобы Max не пережимал звук. "
+            "Можно отправлять изображения, файлы и голосовые/аудиосообщения: чтобы доставить файл пользователю, "
+            "добавь в ответ MEDIA:/absolute/path/to/file. Аудиофайлы и голосовые (.mp3, .wav, .m4a, .ogg) "
+            "отправляются как голосовые/аудиосообщения. "
             "Для inline-кнопок можно добавить в конец ответа скрытый HTML-комментарий "
             "`<!-- max_buttons: [[{\"text\":\"Текст\",\"payload\":\"callback\"}]] -->` "
             "или кнопку-ссылку `<!-- max_buttons: [[{\"text\":\"Открыть\",\"url\":\"https://example.com\"}]] -->`, "

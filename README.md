@@ -144,8 +144,8 @@ to deliver a generated file:
 MEDIA:/absolute/path/to/file.png
 ```
 
-Audio files such as `.mp3`, `.wav`, `.m4a`, and `.ogg` are best delivered as
-files/documents when preserving sound quality matters.
+Audio files such as `.mp3`, `.wav`, `.m4a`, and `.ogg` are delivered as
+native audio/voice attachments by default (or as files/documents when `force_document` is set).
 
 ## Inline Keyboards
 
