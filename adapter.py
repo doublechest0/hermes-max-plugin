@@ -78,6 +78,43 @@ def _max_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _patch_platform_pseudo_member_leak() -> None:
+    """Prevent Platform('max') from leaking into Platform.__members__.
+
+    In Hermes Agent, Platform._add_pseudo_member dynamically adds unknown platform
+    names to Platform._member_map_ in the shared Python process. This causes
+    _messaging_platform_catalog() to treat 'max' as a built-in platform via
+    `builtin = [m.value for m in Platform.__members__.values()]`, rendering a phantom,
+    empty card without settings in profiles where the plugin is not installed (e.g. default).
+
+    We clean 'MAX' and 'max' from _member_map_ and patch _add_pseudo_member so pseudo-members
+    are retained in _value2member_map_ (so Platform('max') continues to return the
+    expected Platform enum instance) without leaking into _member_map_ / Platform.__members__.
+    """
+    try:
+        from gateway.config import Platform
+
+        if hasattr(Platform, "_member_map_"):
+            Platform._member_map_.pop("MAX", None)
+            Platform._member_map_.pop("max", None)
+        orig_add = getattr(Platform, "_add_pseudo_member", None)
+        if orig_add and not getattr(orig_add, "_no_leak_patched", False):
+            @classmethod
+            def _clean_add_pseudo_member(cls, value: str):
+                pseudo = orig_add(value)
+                cls._member_map_.pop(pseudo._name_, None)
+                cls._member_map_.pop(value, None)
+                return pseudo
+
+            _clean_add_pseudo_member._no_leak_patched = True
+            Platform._add_pseudo_member = _clean_add_pseudo_member
+    except Exception as e:
+        logger.debug("Max: _patch_platform_pseudo_member_leak skipped: %s", e)
+
+
+_patch_platform_pseudo_member_leak()
+
+
 def _max_poll_state_path() -> Path:
     """Disk location for the long-poll marker (survives gateway restarts)."""
     return get_hermes_home() / "plugins" / "max" / "state" / "poll_state.json"
@@ -699,14 +736,6 @@ def _resolve_platform_var(
 
         # Profile home directory
         dirs_to_check.append(home)
-
-        # If home is a root container and profiles exist
-        if (home / "profiles").is_dir():
-            sub_profiles = [p for p in (home / "profiles").iterdir() if p.is_dir() and (p / ".env").is_file()]
-            for p in sub_profiles:
-                if p not in dirs_to_check:
-                    dirs_to_check.append(p)
-
         dirs_to_check.append(Path.cwd())
     except Exception:
         pass
@@ -1916,6 +1945,11 @@ def validate_config(config: PlatformConfig) -> bool:
     return True
 
 
+def is_connected(config: Any) -> bool:
+    """Check whether Max is configured (env or config.yaml) for a given profile."""
+    return bool(_resolve_platform_var("MAX_BOT_TOKEN", config))
+
+
 def _env_enablement() -> dict:
     """Seed Max config from environment variables."""
     data: dict[str, Any] = {}
@@ -2031,12 +2065,14 @@ async def _standalone_send(
 
 def register(ctx):
     """Register Max Messenger platform adapter."""
+    _patch_platform_pseudo_member_leak()
     ctx.register_platform(
         name="max",
         label="Max Messenger",
         adapter_factory=lambda cfg: MaxAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
+        is_connected=is_connected,
         env_enablement_fn=_env_enablement,
         standalone_sender_fn=_standalone_send,
         required_env=["MAX_BOT_TOKEN"],
