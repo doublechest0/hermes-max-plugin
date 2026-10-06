@@ -3,7 +3,10 @@ kind: platform
 version: 1.0.0
 description: Max Messenger platform adapter (https://max.ru). Supports webhook or long-polling inbound, text, attachments, images, files, voice messages, inline keyboards.
 requires_env:
-  - MAX_BOT_TOKEN
+  - name: MAX_BOT_TOKEN
+    description: "MAX bot token used as the API Authorization header."
+    prompt: "MAX bot token"
+    password: true
 optional_env:
   - name: MAX_TRANSPORT
     description: "Inbound transport: webhook or polling. Defaults to webhook when MAX_WEBHOOK_URL is set, otherwise polling."
@@ -34,7 +37,7 @@ optional_env:
     prompt: "MAX update types"
     password: false
   - name: MAX_API_BASE_URL
-    description: "MAX Bot API base URL (default: https://platform-api.max.ru). Useful for tests, proxies, or compatible endpoints."
+    description: "MAX Bot API base URL (default: https://platform-api2.max.ru). Useful for tests, proxies, or compatible endpoints."
     prompt: "MAX API base URL"
     password: false
   - name: MAX_ALLOWED_USERS
