@@ -115,6 +115,128 @@ def _patch_platform_pseudo_member_leak() -> None:
 _patch_platform_pseudo_member_leak()
 
 
+_MAX_ENV_DEFINITIONS = (
+    {
+        "name": "MAX_BOT_TOKEN",
+        "description": "MAX bot token used as the API Authorization header.",
+        "prompt": "MAX bot token",
+        "password": True,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_TRANSPORT",
+        "description": "Inbound transport: webhook or polling. Defaults to webhook when MAX_WEBHOOK_URL is set, otherwise polling.",
+        "prompt": "MAX transport (webhook or polling)",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_WEBHOOK_URL",
+        "description": "Public HTTPS webhook URL registered with MAX, e.g. https://example.com/max/webhook. MAX requires port 443 externally.",
+        "prompt": "MAX public webhook URL",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_WEBHOOK_SECRET",
+        "description": "Secret sent by MAX in X-Max-Bot-Api-Secret for webhook requests. Allowed: A-Z, a-z, 0-9, underscore, hyphen; 5-256 chars.",
+        "prompt": "MAX webhook secret",
+        "password": True,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_WEBHOOK_HOST",
+        "description": "Local webhook bind host (default: 0.0.0.0). Use a reverse proxy from 443 to this listener.",
+        "prompt": "MAX webhook bind host",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_WEBHOOK_PORT",
+        "description": "Local webhook listen port (default: 8650). Public MAX endpoint must still be HTTPS on 443.",
+        "prompt": "MAX webhook port",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_WEBHOOK_PATH",
+        "description": "Local webhook path (default: /max/webhook). Must match the path in MAX_WEBHOOK_URL.",
+        "prompt": "MAX webhook path",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_UPDATE_TYPES",
+        "description": "Comma-separated MAX update types to subscribe to (default: message_created,message_callback,bot_started).",
+        "prompt": "MAX update types",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_API_BASE_URL",
+        "description": "MAX Bot API base URL (default: https://platform-api2.max.ru). Useful for tests, proxies, or compatible endpoints.",
+        "prompt": "MAX API base URL",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_ALLOWED_USERS",
+        "description": "Comma-separated MAX user IDs allowed to talk to the bot.",
+        "prompt": "Allowed MAX users (comma-separated)",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_ALLOW_ALL_USERS",
+        "description": "Allow any MAX user to trigger the bot (dev only).",
+        "prompt": "Allow all MAX users? (true/false)",
+        "password": False,
+        "category": "messaging",
+    },
+    {
+        "name": "MAX_HOME_CHANNEL",
+        "description": "Default MAX chat ID for cron / notification delivery.",
+        "prompt": "MAX home channel (chat ID)",
+        "password": False,
+        "category": "messaging",
+    },
+)
+
+
+def _register_max_web_metadata() -> None:
+    """Ensure all MAX settings are known to Hermes Web UI and Channels catalog."""
+    try:
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        for meta in _MAX_ENV_DEFINITIONS:
+            name = meta["name"]
+            if name not in OPTIONAL_ENV_VARS:
+                OPTIONAL_ENV_VARS[name] = {
+                    "description": meta["description"],
+                    "prompt": meta["prompt"],
+                    "url": "https://max.ru",
+                    "password": meta["password"],
+                    "category": meta["category"],
+                }
+    except Exception as e:
+        logger.debug("Max: registering OPTIONAL_ENV_VARS skipped: %s", e)
+
+    try:
+        from hermes_cli.web_server_messaging import _PLATFORM_OVERRIDES
+        all_env_keys = tuple(m["name"] for m in _MAX_ENV_DEFINITIONS)
+        _PLATFORM_OVERRIDES["max"] = {
+            "name": "Max Messenger",
+            "description": "Max Messenger platform adapter (https://max.ru). Supports webhook and polling.",
+            "docs_url": "https://max.ru",
+            "env_vars": all_env_keys,
+            "required_env": ("MAX_BOT_TOKEN",),
+        }
+    except Exception as e:
+        logger.debug("Max: registering _PLATFORM_OVERRIDES skipped: %s", e)
+
+
+_register_max_web_metadata()
+
+
 def _max_poll_state_path() -> Path:
     """Disk location for the long-poll marker (survives gateway restarts)."""
     return get_hermes_home() / "plugins" / "max" / "state" / "poll_state.json"
@@ -2066,6 +2188,7 @@ async def _standalone_send(
 def register(ctx):
     """Register Max Messenger platform adapter."""
     _patch_platform_pseudo_member_leak()
+    _register_max_web_metadata()
     ctx.register_platform(
         name="max",
         label="Max Messenger",
