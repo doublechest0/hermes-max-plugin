@@ -571,14 +571,134 @@ def _max_auto_keyboard_from_numbered_options(text: str) -> Optional[dict[str, An
     return _max_inline_keyboard_attachment(buttons)
 
 
+def _parse_env_file_for_key(path: Path, key: str) -> Optional[str]:
+    """Parse a single key from a .env file on disk without third-party dependencies."""
+    try:
+        if not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8")
+        pattern = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=\s*(.*)$", re.MULTILINE)
+        match = pattern.search(text)
+        if match:
+            raw = match.group(1).strip()
+            if raw.startswith('"'):
+                end = raw.find('"', 1)
+                val = raw[1:end] if end != -1 else raw[1:]
+            elif raw.startswith("'"):
+                end = raw.find("'", 1)
+                val = raw[1:end] if end != -1 else raw[1:]
+            else:
+                val = raw.split("#", 1)[0].strip()
+            return val.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_platform_var(
+    key: str,
+    config: Optional[PlatformConfig] = None,
+    default: str = "",
+) -> str:
+    """Resolve a platform setting or credential with multi-layer fallback:
+    1. config direct attributes (e.g. config.token)
+    2. config.extra dictionary (e.g. extra['token'], extra['bot_token'], extra[key.lower()])
+    3. Hermes scoped secret manager (agent.secret_scope.get_secret) for MULTIPLEX profiles
+    4. Process environment (os.getenv)
+    5. Profile-local .env files on disk (HERMES_HOME, active profile, profiles/*)
+    """
+    # 1. Check config direct attributes
+    if config is not None:
+        if key == "MAX_BOT_TOKEN":
+            cfg_tok = getattr(config, "token", None) or getattr(config, "api_key", None)
+            if cfg_tok and str(cfg_tok).strip():
+                return str(cfg_tok).strip()
+
+        # 2. Check config.extra dictionary
+        extra = getattr(config, "extra", {}) or {}
+        if isinstance(extra, dict):
+            short_key = key.lower().removeprefix("max_")
+            candidates = [
+                key,
+                key.lower(),
+                short_key,
+                f"max_{short_key}",
+            ]
+            if key == "MAX_BOT_TOKEN":
+                candidates.extend(["token", "bot_token", "api_key"])
+            for candidate in candidates:
+                val = extra.get(candidate)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+
+    # 3. Hermes profile-scoped secret manager (crucial for gateway.multiplex_profiles mode)
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(key, None)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+
+    # 4. Process-global environment
+    val = os.getenv(key)
+    if val is not None and str(val).strip():
+        return str(val).strip()
+
+    # 5. Disk fallback: check .env in candidate directories
+    dirs_to_check: list[Path] = []
+    try:
+        home = get_hermes_home()
+        dirs_to_check.append(home)
+
+        # Check explicit profile hints on config
+        if config is not None:
+            extra = getattr(config, "extra", {}) or {}
+            for attr in ("profile", "profile_name", "profile_dir", "_profile"):
+                p = getattr(config, attr, None) or (extra.get(attr) if isinstance(extra, dict) else None)
+                if p:
+                    dirs_to_check.insert(0, home / "profiles" / str(p))
+                    dirs_to_check.insert(0, Path(str(p)))
+
+        # In multiplex mode, check home/profiles/* subdirectories
+        profiles_dir = home / "profiles"
+        if profiles_dir.is_dir():
+            for p_dir in profiles_dir.iterdir():
+                if p_dir.is_dir() and (p_dir / ".env").is_file():
+                    dirs_to_check.append(p_dir)
+
+        # Common fallback paths
+        std_home = Path.home() / ".hermes"
+        if std_home != home:
+            dirs_to_check.append(std_home)
+            if (std_home / "profiles").is_dir():
+                for p_dir in (std_home / "profiles").iterdir():
+                    if p_dir.is_dir() and (p_dir / ".env").is_file():
+                        dirs_to_check.append(p_dir)
+        dirs_to_check.append(Path.cwd())
+    except Exception:
+        pass
+
+    for candidate_dir in dirs_to_check:
+        try:
+            parsed = _parse_env_file_for_key(candidate_dir / ".env", key)
+            if parsed:
+                return parsed
+        except Exception:
+            continue
+
+    return default
+
+
 class MaxAdapter(BasePlatformAdapter):
     """MAX Messenger adapter supporting webhook and long-polling transports."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("max"))
         extra = config.extra or {}
-        # 1. env var → 2. config token → 3. extra.token
-        self.token = os.getenv("MAX_BOT_TOKEN") or getattr(config, "token", None) or extra.get("token", "")
+        # Multi-layer resolution: config.token -> extra.token -> secret_scope -> os.getenv -> disk .env
+        self.token = _resolve_platform_var("MAX_BOT_TOKEN", config)
         self._session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._last_event_id: int = extra.get("last_event_id", 0)
@@ -587,37 +707,31 @@ class MaxAdapter(BasePlatformAdapter):
         self._last_chat_action_at: Dict[tuple[str, str], float] = {}
         self._clarify_state: dict[str, str] = {}
         self._api_base_url = str(
-            os.getenv("MAX_API_BASE_URL")
-            or extra.get("api_base_url")
-            or extra.get("base_url")
-            or DEFAULT_MAX_API_BASE_URL
+            _resolve_platform_var("MAX_API_BASE_URL", config, default=DEFAULT_MAX_API_BASE_URL)
         ).rstrip("/")
         self._bot_user_id = ""
         configured_transport = (
-            os.getenv("MAX_TRANSPORT")
-            or os.getenv("MAX_MODE")
-            or extra.get("transport")
-            or extra.get("mode")
-            or ""
+            _resolve_platform_var("MAX_TRANSPORT", config)
+            or _resolve_platform_var("MAX_MODE", config)
         )
         self._webhook_url = str(
-            os.getenv("MAX_WEBHOOK_URL") or extra.get("webhook_url") or ""
+            _resolve_platform_var("MAX_WEBHOOK_URL", config)
         ).strip()
         self._transport = str(configured_transport or ("webhook" if self._webhook_url else "polling")).strip().lower()
         self._webhook_secret = str(
-            os.getenv("MAX_WEBHOOK_SECRET") or extra.get("webhook_secret") or extra.get("secret") or ""
+            _resolve_platform_var("MAX_WEBHOOK_SECRET", config)
         ).strip()
         self._webhook_host = str(
-            os.getenv("MAX_WEBHOOK_HOST") or extra.get("webhook_host") or DEFAULT_WEBHOOK_HOST
+            _resolve_platform_var("MAX_WEBHOOK_HOST", config, default=DEFAULT_WEBHOOK_HOST)
         ).strip()
         self._webhook_port = int(
-            os.getenv("MAX_WEBHOOK_PORT") or extra.get("webhook_port") or DEFAULT_WEBHOOK_PORT
+            _resolve_platform_var("MAX_WEBHOOK_PORT", config, default=str(DEFAULT_WEBHOOK_PORT))
         )
         self._webhook_path = self._normalize_path(
-            os.getenv("MAX_WEBHOOK_PATH") or extra.get("webhook_path") or DEFAULT_WEBHOOK_PATH
+            _resolve_platform_var("MAX_WEBHOOK_PATH", config, default=DEFAULT_WEBHOOK_PATH)
         )
         self._webhook_update_types = self._parse_update_types(
-            os.getenv("MAX_UPDATE_TYPES") or extra.get("update_types") or DEFAULT_UPDATE_TYPES
+            _resolve_platform_var("MAX_UPDATE_TYPES", config, default=DEFAULT_UPDATE_TYPES)
         )
         self._webhook_runner: Optional[web.AppRunner] = None
         self._webhook_tasks: set[asyncio.Task] = set()
@@ -1081,7 +1195,7 @@ class MaxAdapter(BasePlatformAdapter):
         await self._send_chat_action(chat_id, "mark_seen")
 
     def _inbound_media_cache_dir(self) -> Path:
-        root = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+        root = get_hermes_home()
         cache_dir = root / "cache" / "max" / "inbound"
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
@@ -1716,65 +1830,74 @@ def check_requirements() -> bool:
 
 
 def validate_config(config: PlatformConfig) -> bool:
-    """Validate that we have a token."""
-    extra = getattr(config, "extra", {}) or {}
-    token = os.getenv("MAX_BOT_TOKEN") or getattr(config, "token", None) or extra.get("token", "")
+    """Validate that we have a token and valid transport settings."""
+    token = _resolve_platform_var("MAX_BOT_TOKEN", config)
     if not token:
+        logger.warning(
+            "Max: validate_config failed — bot token not found. "
+            "Checked config.token, config.extra, secret_scope, environment, and profile .env files."
+        )
         return False
 
     transport = str(
-        os.getenv("MAX_TRANSPORT")
-        or os.getenv("MAX_MODE")
-        or extra.get("transport")
-        or extra.get("mode")
-        or ""
+        _resolve_platform_var("MAX_TRANSPORT", config)
+        or _resolve_platform_var("MAX_MODE", config)
     ).strip().lower()
-    webhook_url = str(os.getenv("MAX_WEBHOOK_URL") or extra.get("webhook_url") or "").strip()
-    if transport == "webhook" or webhook_url:
-        return webhook_url.startswith("https://")
+    webhook_url = str(
+        _resolve_platform_var("MAX_WEBHOOK_URL", config)
+    ).strip()
+
+    if transport == "webhook" or (not transport and webhook_url):
+        if not webhook_url:
+            logger.warning("Max: validate_config failed — transport is 'webhook' but MAX_WEBHOOK_URL is not configured")
+            return False
+        if not webhook_url.startswith("https://"):
+            logger.warning("Max: validate_config failed — MAX_WEBHOOK_URL must start with https://, got: %s", webhook_url)
+            return False
+
     return True
 
 
 def _env_enablement() -> dict:
     """Seed Max config from environment variables."""
     data: dict[str, Any] = {}
-    token = os.getenv("MAX_BOT_TOKEN", "").strip()
+    token = _resolve_platform_var("MAX_BOT_TOKEN").strip()
     if token:
         data["token"] = token
-    home = os.getenv("MAX_HOME_CHANNEL", "").strip()
+    home = _resolve_platform_var("MAX_HOME_CHANNEL").strip()
     if home:
         data["home_channel"] = {
             "chat_id": home,
-            "name": os.getenv("MAX_HOME_CHANNEL_NAME", "Home"),
-            "thread_id": os.getenv("MAX_HOME_CHANNEL_THREAD_ID", "").strip() or None,
+            "name": _resolve_platform_var("MAX_HOME_CHANNEL_NAME", default="Home"),
+            "thread_id": _resolve_platform_var("MAX_HOME_CHANNEL_THREAD_ID").strip() or None,
         }
-    transport = os.getenv("MAX_TRANSPORT", "").strip()
-    webhook_url = os.getenv("MAX_WEBHOOK_URL", "").strip()
+    transport = _resolve_platform_var("MAX_TRANSPORT").strip()
+    webhook_url = _resolve_platform_var("MAX_WEBHOOK_URL").strip()
     if transport:
         data["transport"] = transport
     elif webhook_url:
         data["transport"] = "webhook"
     if webhook_url:
         data["webhook_url"] = webhook_url
-    webhook_secret = os.getenv("MAX_WEBHOOK_SECRET", "").strip()
+    webhook_secret = _resolve_platform_var("MAX_WEBHOOK_SECRET").strip()
     if webhook_secret:
         data["webhook_secret"] = webhook_secret
-    webhook_host = os.getenv("MAX_WEBHOOK_HOST", "").strip()
+    webhook_host = _resolve_platform_var("MAX_WEBHOOK_HOST").strip()
     if webhook_host:
         data["webhook_host"] = webhook_host
-    webhook_port = os.getenv("MAX_WEBHOOK_PORT", "").strip()
+    webhook_port = _resolve_platform_var("MAX_WEBHOOK_PORT").strip()
     if webhook_port:
         try:
             data["webhook_port"] = int(webhook_port)
         except ValueError:
             data["webhook_port"] = webhook_port
-    webhook_path = os.getenv("MAX_WEBHOOK_PATH", "").strip()
+    webhook_path = _resolve_platform_var("MAX_WEBHOOK_PATH").strip()
     if webhook_path:
         data["webhook_path"] = webhook_path
-    api_base_url = os.getenv("MAX_API_BASE_URL", "").strip()
+    api_base_url = _resolve_platform_var("MAX_API_BASE_URL").strip()
     if api_base_url:
         data["api_base_url"] = api_base_url
-    update_types = os.getenv("MAX_UPDATE_TYPES", "").strip()
+    update_types = _resolve_platform_var("MAX_UPDATE_TYPES").strip()
     if update_types:
         data["update_types"] = [item.strip() for item in update_types.split(",") if item.strip()]
     return data
