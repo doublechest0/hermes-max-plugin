@@ -646,36 +646,38 @@ def _resolve_platform_var(
     if val is not None and str(val).strip():
         return str(val).strip()
 
-    # 5. Disk fallback: check .env in candidate directories
+    # 5. Disk fallback: check .env strictly for the target profile home
     dirs_to_check: list[Path] = []
     try:
         home = get_hermes_home()
         dirs_to_check.append(home)
 
-        # Check explicit profile hints on config
+        # Check explicit profile hints on config / extra
+        target_profile: Optional[str] = None
         if config is not None:
             extra = getattr(config, "extra", {}) or {}
             for attr in ("profile", "profile_name", "profile_dir", "_profile"):
                 p = getattr(config, attr, None) or (extra.get(attr) if isinstance(extra, dict) else None)
                 if p:
-                    dirs_to_check.insert(0, home / "profiles" / str(p))
-                    dirs_to_check.insert(0, Path(str(p)))
+                    target_profile = str(p)
+                    dirs_to_check.insert(0, home / "profiles" / target_profile)
+                    dirs_to_check.insert(0, Path(target_profile))
+                    break
 
-        # In multiplex mode, check home/profiles/* subdirectories
-        profiles_dir = home / "profiles"
-        if profiles_dir.is_dir():
-            for p_dir in profiles_dir.iterdir():
-                if p_dir.is_dir() and (p_dir / ".env").is_file():
-                    dirs_to_check.append(p_dir)
+        # Check active_profile file in home directory
+        if not target_profile:
+            active_profile_file = home / "active_profile"
+            if active_profile_file.is_file():
+                act_name = active_profile_file.read_text(encoding="utf-8").strip()
+                if act_name:
+                    dirs_to_check.insert(0, home / "profiles" / act_name)
 
-        # Common fallback paths
-        std_home = Path.home() / ".hermes"
-        if std_home != home:
-            dirs_to_check.append(std_home)
-            if (std_home / "profiles").is_dir():
-                for p_dir in (std_home / "profiles").iterdir():
-                    if p_dir.is_dir() and (p_dir / ".env").is_file():
-                        dirs_to_check.append(p_dir)
+        # If home is a root container and exactly one profile exists, safe to check it
+        if not target_profile and (home / "profiles").is_dir():
+            sub_profiles = [p for p in (home / "profiles").iterdir() if p.is_dir() and (p / ".env").is_file()]
+            if len(sub_profiles) == 1:
+                dirs_to_check.append(sub_profiles[0])
+
         dirs_to_check.append(Path.cwd())
     except Exception:
         pass
